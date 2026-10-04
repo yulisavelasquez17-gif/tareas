@@ -11,15 +11,6 @@ python app.py
 
 API local: http://127.0.0.1:5000. La base se crea automáticamente en `data/tasks.sqlite3`. Para cambiar su ubicación, define `DATABASE_PATH`. La API se ejecuta con Uvicorn para desarrollo local.
 
-Para usar PostgreSQL (por ejemplo, Supabase), define `DATABASE_URL` antes de iniciar. La aplicación crea las tablas necesarias automáticamente:
-
-```sh
-export DATABASE_URL='postgresql://usuario:contraseña@servidor:5432/postgres'
-python app.py
-```
-
-No guardes la URI real en Git: contiene la contraseña de la base de datos.
-
 Documentación interactiva: http://127.0.0.1:5000/docs. Ejecuta `/login` con usuario y contraseña, copia el token y pégalo en **Authorize** para probar las rutas protegidas.
 
 También puedes iniciar con recarga automática:
