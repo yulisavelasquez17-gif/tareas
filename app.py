@@ -1,8 +1,5 @@
-from contextlib import closing
 import hashlib
-import os
 import secrets
-import sqlite3
 import time
 from pathlib import Path
 
@@ -11,35 +8,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import create_engine, delete, event, insert, select, update
+from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from werkzeug.security import check_password_hash, generate_password_hash
 
+from database import engine as default_engine, metadata, tasks, tokens, users
+
 AUTHORIZED = 'Estás autorizado'
 UNAUTHORIZED = 'Por favor revise sus credenciales que no se encuentra autorizado'
-SCHEMA = '''
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    nombre TEXT NOT NULL,
-    apellido TEXT NOT NULL,
-    usuario TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tokens (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    token_hash TEXT NOT NULL UNIQUE,
-    expires_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    titulo TEXT NOT NULL,
-    descripcion TEXT NOT NULL DEFAULT '',
-    realizada INTEGER NOT NULL DEFAULT 0 CHECK (realizada IN (0, 1))
-);
-CREATE INDEX IF NOT EXISTS tasks_user_id ON tasks(user_id);
-CREATE INDEX IF NOT EXISTS tokens_user_id ON tokens(user_id);
-'''
 
 
 class TextBody(BaseModel):
@@ -76,15 +53,40 @@ class TaskUpdateBody(TaskCreateBody):
 
 def create_app(database=None):
     app = FastAPI(title='API de tareas', version='1.0.0')
-    database_path = str(database or os.environ.get('DATABASE_PATH', Path(__file__).parent / 'data' / 'tasks.sqlite3'))
-    Path(database_path).parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(database_path)) as db:
-        db.executescript(SCHEMA)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request, error):
+        return JSONResponse(status_code=400, content={'message': 'Solicitud inválida'})
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_error_handler(request, error):
+        return JSONResponse(status_code=error.status_code, content={'message': error.detail})
+
+    @app.exception_handler(ValueError)
+    async def value_error_handler(request, error):
+        return JSONResponse(status_code=400, content={'message': str(error)})
+
+    if database is None:
+        app_engine = default_engine
+    else:
+        database_path = Path(database)
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        app_engine = create_engine(
+            f'sqlite:///{database_path}',
+            connect_args={'check_same_thread': False},
+        )
+
+    if app_engine.dialect.name == 'sqlite':
+        @event.listens_for(app_engine, 'connect')
+        def enable_sqlite_foreign_keys(connection, connection_record):
+            cursor = connection.cursor()
+            cursor.execute('PRAGMA foreign_keys = ON')
+            cursor.close()
+
+    metadata.create_all(app_engine)
 
     def get_db():
-        with closing(sqlite3.connect(database_path, check_same_thread=False)) as db:
-            db.row_factory = sqlite3.Row
-            db.execute('PRAGMA foreign_keys = ON')
+        with app_engine.connect() as db:
             yield db
 
     bearer = HTTPBearer(auto_error=False)
@@ -93,7 +95,11 @@ def create_app(database=None):
         if credentials is None:
             raise HTTPException(status_code=401, detail=UNAUTHORIZED)
         token_hash = hashlib.sha256(credentials.credentials.encode()).hexdigest()
-        token = db.execute('SELECT user_id FROM tokens WHERE token_hash = ? AND expires_at > ?', (token_hash, int(time.time()))).fetchone()
+        query = select(tokens.c.user_id).where(
+            tokens.c.token_hash == token_hash,
+            tokens.c.expires_at > int(time.time()),
+        )
+        token = db.execute(query).mappings().first()
         if token is None:
             raise HTTPException(status_code=401, detail=UNAUTHORIZED)
         return token['user_id']
@@ -102,7 +108,11 @@ def create_app(database=None):
         return {'id': row['id'], 'titulo': row['titulo'], 'descripcion': row['descripcion'], 'realizada': bool(row['realizada'])}
 
     def find_task(task_id, db, user_id):
-        return db.execute('SELECT * FROM tasks WHERE id = ? AND user_id = ?', (task_id, user_id)).fetchone()
+        query = select(tasks).where(
+            tasks.c.id == task_id,
+            tasks.c.user_id == user_id,
+        )
+        return db.execute(query).mappings().first()
 
     @app.post('/register', status_code=201)
     def register(payload: RegisterBody, db=Depends(get_db)):
@@ -110,23 +120,35 @@ def create_app(database=None):
         if len(data['contrasena']) < 8:
             raise ValueError('La contraseña debe tener al menos 8 caracteres')
         try:
-            with db:
-                cursor = db.execute('INSERT INTO users (nombre, apellido, usuario, password_hash) VALUES (?, ?, ?, ?)', (data['nombre'], data['apellido'], data['usuario'], generate_password_hash(data['contrasena'])))
-        except sqlite3.IntegrityError:
+            query = insert(users).values(
+                nombre=data['nombre'],
+                apellido=data['apellido'],
+                usuario=data['usuario'],
+                password_hash=generate_password_hash(data['contrasena']),
+            )
+            result = db.execute(query)
+            db.commit()
+        except IntegrityError:
+            db.rollback()
             raise HTTPException(status_code=409, detail='El usuario ya existe')
-        return dict(message='Usuario creado', id=cursor.lastrowid)
+        return dict(message='Usuario creado', id=result.inserted_primary_key[0])
 
     @app.post('/login')
     def login(payload: LoginBody, db=Depends(get_db)):
         data = payload.model_dump()
-        user = db.execute('SELECT * FROM users WHERE usuario = ?', (data['usuario'],)).fetchone()
+        query = select(users).where(users.c.usuario == data['usuario'])
+        user = db.execute(query).mappings().first()
         if user is None or not check_password_hash(user['password_hash'], data['contrasena']):
             raise HTTPException(status_code=401, detail=UNAUTHORIZED)
         token = secrets.token_urlsafe(32)
         expires_at = int(time.time()) + 3600
-        with db:
-            db.execute('DELETE FROM tokens WHERE expires_at <= ?', (int(time.time()),))
-            db.execute('INSERT INTO tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)', (user['id'], hashlib.sha256(token.encode()).hexdigest(), expires_at))
+        db.execute(delete(tokens).where(tokens.c.expires_at <= int(time.time())))
+        db.execute(insert(tokens).values(
+            user_id=user['id'],
+            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            expires_at=expires_at,
+        ))
+        db.commit()
         return dict(message=AUTHORIZED, token=token, token_type='Bearer', expires_at=expires_at)
     
     
@@ -134,13 +156,20 @@ def create_app(database=None):
     @app.post('/tasks', status_code=201)
     def create_task(payload: TaskCreateBody, user_id=Depends(protected), db=Depends(get_db)):
         data = payload.model_dump()
-        with db:
-            cursor = db.execute('INSERT INTO tasks (user_id, titulo, descripcion) VALUES (?, ?, ?)', (user_id, data['titulo'], data.get('descripcion', '')))
-        return dict(message=AUTHORIZED, task=task_json(find_task(cursor.lastrowid, db, user_id)))
+        query = insert(tasks).values(
+            user_id=user_id,
+            titulo=data['titulo'],
+            descripcion=data.get('descripcion', ''),
+        )
+        result = db.execute(query)
+        db.commit()
+        task_id = result.inserted_primary_key[0]
+        return dict(message=AUTHORIZED, task=task_json(find_task(task_id, db, user_id)))
 
     @app.get('/tasks')
     def list_tasks(user_id=Depends(protected), db=Depends(get_db)):
-        rows = db.execute('SELECT * FROM tasks WHERE user_id = ? ORDER BY id', (user_id,)).fetchall()
+        query = select(tasks).where(tasks.c.user_id == user_id).order_by(tasks.c.id)
+        rows = db.execute(query).mappings().all()
         return dict(message=AUTHORIZED, tasks=[task_json(row) for row in rows])
 
     @app.get('/tasks/{task_id}')
@@ -155,15 +184,23 @@ def create_app(database=None):
         if find_task(task_id, db, user_id) is None:
             raise HTTPException(status_code=404, detail='Tarea no encontrada')
         data = payload.model_dump()
-        with db:
-            db.execute('UPDATE tasks SET titulo = ?, descripcion = ? WHERE id = ? AND user_id = ?', (data['titulo'], data['descripcion'], task_id, user_id))
+        query = update(tasks).where(
+            tasks.c.id == task_id,
+            tasks.c.user_id == user_id,
+        ).values(titulo=data['titulo'], descripcion=data['descripcion'])
+        db.execute(query)
+        db.commit()
         return dict(message=AUTHORIZED, task=task_json(find_task(task_id, db, user_id)))
 
     def set_completed(task_id, completed, db, user_id):
         if find_task(task_id, db, user_id) is None:
             raise HTTPException(status_code=404, detail='Tarea no encontrada')
-        with db:
-            db.execute('UPDATE tasks SET realizada = ? WHERE id = ? AND user_id = ?', (completed, task_id, user_id))
+        query = update(tasks).where(
+            tasks.c.id == task_id,
+            tasks.c.user_id == user_id,
+        ).values(realizada=bool(completed))
+        db.execute(query)
+        db.commit()
         return dict(message=AUTHORIZED, task=task_json(find_task(task_id, db, user_id)))
 
     @app.put('/tasks/{task_id}/complete')
